@@ -1,135 +1,467 @@
+/*
+ * VOS — Desktop Shell
+ * Main entry point for the desktop virtual OS environment.
+ * Uses SDL2 + OpenGL3 + ImGui for the UI.
+ */
+
 #include "imgui.h"
 #include "imgui_impl_sdl2.h"
 #include "imgui_impl_opengl3.h"
 #include <SDL.h>
 #include <SDL_opengl.h>
-#include <iostream>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
 
 #include "core/kernel.h"
+#include "core/vfs.h"
 #include "core/privacy.h"
 #include "core/mesh_net.h"
 #include "core/lockdown.h"
 #include "core/crypto.h"
+#include "apps/dialer.h"
+#include "apps/sms.h"
+#include "apps/camera.h"
 #include "vos/log.h"
 
 using namespace vos;
 
-// Global System Objects
-static Kernel*          g_kernel = nullptr;
-static PrivacyEngine*   g_privacy = nullptr;
-static MeshNet*         g_mesh = nullptr;
-static LockdownManager* g_lockdown = nullptr;
-static Crypto*          g_crypto = nullptr;
+// ─── Global System Objects ───────────────────────────────────
+static Kernel          g_kernel;
+static VirtualFS       g_vfs;
+static Crypto          g_crypto;
+static PrivacyEngine   g_privacy;
+static MeshNet         g_mesh;
+static LockdownManager g_lockdown;
+static Dialer          g_dialer;
+static SmsApp          g_sms;
+static CameraApp       g_camera;
 
-// UI State
-static bool g_show_dialer = false;
-static bool g_show_sms = false;
-static bool g_show_camera = false;
-static char g_sms_input[256] = "";
-static std::string g_active_peer = "";
+// ─── UI State ────────────────────────────────────────────────
+static bool g_show_dialer  = false;
+static bool g_show_sms     = false;
+static bool g_show_camera  = false;
+static bool g_show_system  = false;
+static bool g_show_lockdown_picker = false;
 
-void render_status_bar() {
-    auto identity = g_privacy->get_current_identity();
-    auto remaining = g_lockdown->get_remaining_time();
+static char g_dial_number[32]  = "";
+static char g_sms_input[512]   = "";
+static std::string g_active_peer;
+static int g_lockdown_minutes  = 5;
+
+// ─── Custom VOS Theme ────────────────────────────────────────
+static void apply_vos_theme() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    style.WindowRounding    = 6.0f;
+    style.FrameRounding     = 4.0f;
+    style.GrabRounding      = 3.0f;
+    style.WindowBorderSize  = 1.0f;
+    style.FramePadding      = ImVec2(8, 4);
+    style.ItemSpacing       = ImVec2(8, 6);
+
+    ImVec4* c = style.Colors;
+    c[ImGuiCol_WindowBg]        = ImVec4(0.08f, 0.08f, 0.10f, 0.95f);
+    c[ImGuiCol_TitleBg]         = ImVec4(0.05f, 0.05f, 0.07f, 1.00f);
+    c[ImGuiCol_TitleBgActive]   = ImVec4(0.10f, 0.35f, 0.60f, 1.00f);
+    c[ImGuiCol_FrameBg]         = ImVec4(0.12f, 0.12f, 0.15f, 1.00f);
+    c[ImGuiCol_FrameBgHovered]  = ImVec4(0.18f, 0.22f, 0.30f, 1.00f);
+    c[ImGuiCol_Button]          = ImVec4(0.15f, 0.40f, 0.65f, 1.00f);
+    c[ImGuiCol_ButtonHovered]   = ImVec4(0.20f, 0.50f, 0.75f, 1.00f);
+    c[ImGuiCol_ButtonActive]    = ImVec4(0.10f, 0.30f, 0.55f, 1.00f);
+    c[ImGuiCol_Header]          = ImVec4(0.15f, 0.35f, 0.55f, 0.80f);
+    c[ImGuiCol_HeaderHovered]   = ImVec4(0.20f, 0.45f, 0.65f, 0.80f);
+    c[ImGuiCol_Separator]       = ImVec4(0.25f, 0.25f, 0.30f, 1.00f);
+    c[ImGuiCol_Text]            = ImVec4(0.90f, 0.92f, 0.95f, 1.00f);
+    c[ImGuiCol_TextDisabled]    = ImVec4(0.45f, 0.50f, 0.55f, 1.00f);
+}
+
+// ─── Status Bar ──────────────────────────────────────────────
+static void render_status_bar(float display_w) {
+    auto identity  = g_privacy.get_current_identity();
+    auto remaining = g_lockdown.get_remaining_time();
 
     ImGui::SetNextWindowPos(ImVec2(0, 0));
-    ImGui::SetNextWindowSize(ImVec2(ImGui::GetIO().DisplaySize.x, 30));
-    ImGui::Begin("StatusBar", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings);
+    ImGui::SetNextWindowSize(ImVec2(display_w, 32));
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                           | ImGuiWindowFlags_NoMove    | ImGuiWindowFlags_NoScrollbar
+                           | ImGuiWindowFlags_NoSavedSettings;
     
-    ImGui::Text("VOS 1.0 | Identity: %s", identity.virtual_ip.c_str());
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.04f, 0.06f, 1.0f));
+    ImGui::Begin("##StatusBar", nullptr, flags);
+
+    // Left: VOS identity
+    ImGui::TextColored(ImVec4(0.3f, 0.7f, 1.0f, 1.0f), "VOS");
     ImGui::SameLine();
-    ImGui::TextDisabled(" (MAC: %s)", identity.virtual_mac.c_str());
-    
-    ImGui::SameLine(ImGui::GetIO().DisplaySize.x - 200);
-    if (g_lockdown->is_active()) {
-        ImGui::TextColored(ImVec4(1, 0.2f, 0.2f, 1), "LOCKED: %llds", (long long)remaining.count());
+    ImGui::Text("| IP: %s", identity.virtual_ip.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("MAC: %s", identity.virtual_mac.c_str());
+    ImGui::SameLine();
+    ImGui::TextDisabled("(#%llu)", (unsigned long long)identity.rotation_count);
+
+    // Middle: peers
+    ImGui::SameLine(display_w * 0.45f);
+    auto peers = g_mesh.get_peers();
+    ImGui::Text("Peers: %zu", peers.size());
+
+    // Right: lockdown + unread
+    ImGui::SameLine(display_w - 280);
+    int unread = g_sms.total_unread();
+    if (unread > 0) {
+        ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "[%d MSG]", unread);
+        ImGui::SameLine();
+    }
+
+    if (g_lockdown.is_active()) {
+        long long secs = (long long)remaining.count();
+        ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f),
+                           "LOCKED %02lld:%02lld", secs / 60, secs % 60);
     } else {
-        ImGui::Text("UNLOCKED");
+        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "UNLOCKED");
     }
-    
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+}
+
+// ─── Desktop Launcher ────────────────────────────────────────
+static void render_desktop(float display_w, float display_h) {
+    ImGui::SetNextWindowPos(ImVec2(0, 32));
+    ImGui::SetNextWindowSize(ImVec2(display_w, display_h - 32));
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                           | ImGuiWindowFlags_NoMove    | ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.06f, 0.06f, 0.08f, 1.0f));
+    ImGui::Begin("##Desktop", nullptr, flags);
+
+    ImGui::SetCursorPos(ImVec2(30, 40));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 12.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0, 0));
+
+    // App icons as large buttons
+    auto app_button = [&](const char* label, const char* icon, AppId id, bool* show) {
+        bool allowed = g_lockdown.is_app_allowed(id);
+
+        if (!allowed) {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.1f, 0.1f, 0.8f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.1f, 0.1f, 0.8f));
+        }
+
+        ImGui::BeginGroup();
+        if (ImGui::Button(icon, ImVec2(100, 80))) {
+            if (allowed) *show = true;
+        }
+        float text_w = ImGui::CalcTextSize(label).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (100 - text_w) * 0.5f);
+        ImGui::Text("%s", label);
+        if (!allowed) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX());
+            ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 0.7f), "[LOCKED]");
+        }
+        ImGui::EndGroup();
+
+        if (!allowed) ImGui::PopStyleColor(2);
+    };
+
+    app_button("Phone",   "CALL",  APP_DIALER, &g_show_dialer);
+    ImGui::SameLine(0, 30);
+    app_button("Messages","SMS",   APP_SMS,    &g_show_sms);
+    ImGui::SameLine(0, 30);
+    app_button("Camera",  "CAM",   APP_CAMERA, &g_show_camera);
+    ImGui::SameLine(0, 30);
+
+    // System info (always available)
+    ImGui::BeginGroup();
+    if (ImGui::Button("SYS", ImVec2(100, 80))) g_show_system = true;
+    float tw = ImGui::CalcTextSize("System").x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (100 - tw) * 0.5f);
+    ImGui::Text("System");
+    ImGui::EndGroup();
+
+    ImGui::PopStyleVar(2);
+
+    // Bottom: lockdown control
+    ImGui::SetCursorPos(ImVec2(30, display_h - 32 - 80));
+    if (!g_lockdown.is_active()) {
+        ImGui::Text("Lockdown Mode:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(100);
+        ImGui::SliderInt("##mins", &g_lockdown_minutes, 1, 120, "%d min");
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.7f, 0.15f, 0.15f, 1.0f));
+        if (ImGui::Button("ACTIVATE LOCKDOWN", ImVec2(180, 30))) {
+            g_lockdown.start(Seconds(g_lockdown_minutes * 60));
+        }
+        ImGui::PopStyleColor();
+    } else {
+        auto rem = g_lockdown.get_remaining_time();
+        long long s = (long long)rem.count();
+        ImGui::TextColored(ImVec4(1, 0.4f, 0.4f, 1.0f),
+                           "LOCKDOWN ACTIVE — %02lld:%02lld remaining. Only Phone, SMS, Camera available.",
+                           s / 60, s % 60);
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+}
+
+// ─── Dialer Window ───────────────────────────────────────────
+static void render_dialer() {
+    if (!g_show_dialer) return;
+
+    ImGui::SetNextWindowSize(ImVec2(320, 450), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Phone", &g_show_dialer);
+
+    auto state = g_dialer.get_state();
+
+    if (state == CallState::IDLE) {
+        ImGui::Text("Enter number:");
+        ImGui::SetNextItemWidth(-1);
+        ImGui::InputText("##number", g_dial_number, sizeof(g_dial_number));
+
+        // Keypad
+        ImGui::Spacing();
+        const char* keys[] = {"1","2","3","4","5","6","7","8","9","*","0","#"};
+        for (int i = 0; i < 12; i++) {
+            if (i % 3 != 0) ImGui::SameLine();
+            if (ImGui::Button(keys[i], ImVec2(60, 45))) {
+                size_t len = strlen(g_dial_number);
+                if (len < sizeof(g_dial_number) - 1) {
+                    g_dial_number[len] = keys[i][0];
+                    g_dial_number[len + 1] = '\0';
+                }
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.1f, 0.65f, 0.2f, 1.0f));
+        if (ImGui::Button("CALL", ImVec2(-1, 45))) {
+            g_dialer.dial(g_dial_number);
+        }
+        ImGui::PopStyleColor();
+
+        // Call history
+        ImGui::Separator();
+        ImGui::Text("Recent Calls:");
+        auto& hist = g_dialer.get_history();
+        for (int i = (int)hist.size() - 1; i >= 0 && i >= (int)hist.size() - 10; i--) {
+            ImGui::BulletText("%s %s", hist[i].outgoing ? "->" : "<-",
+                              hist[i].number.c_str());
+        }
+
+    } else {
+        // Active call
+        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "Calling: %s",
+                           g_dialer.get_current_number().c_str());
+        
+        if (state == CallState::DIALING)
+            ImGui::Text("Connecting...");
+        else if (state == CallState::RINGING)
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f), "Ringing...");
+        else if (state == CallState::IN_CALL) {
+            int dur = g_dialer.get_call_duration();
+            ImGui::Text("In Call — %02d:%02d", dur / 60, dur % 60);
+        }
+
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.15f, 0.15f, 1.0f));
+        if (ImGui::Button("HANG UP", ImVec2(-1, 50))) {
+            g_dialer.hang_up();
+        }
+        ImGui::PopStyleColor();
+    }
+
     ImGui::End();
 }
 
-void render_desktop() {
-    ImGui::SetNextWindowPos(ImVec2(0, 30));
-    ImGui::SetNextWindowSize(ImVec2(ImGui::GetIO().DisplaySize.x, ImGui::GetIO().DisplaySize.y - 30));
-    ImGui::Begin("Desktop", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBackground);
-    
-    ImVec2 btn_sz(120, 120);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10.0f);
-    
-    if (ImGui::Button("PHONE", btn_sz)) g_show_dialer = true;
-    ImGui::SameLine();
-    if (ImGui::Button("SMS", btn_sz)) g_show_sms = true;
-    ImGui::SameLine();
-    if (ImGui::Button("CAMERA", btn_sz)) g_show_camera = true;
-    
-    ImGui::PopStyleVar();
-    
-    if (!g_lockdown->is_active()) {
-        ImGui::SetCursorPos(ImVec2(20, ImGui::GetIO().DisplaySize.y - 100));
-        if (ImGui::Button("ACTIVATE LOCKDOWN (1 min)", ImVec2(200, 40))) {
-            g_lockdown->start(Seconds(60));
+// ─── SMS Window ──────────────────────────────────────────────
+static void render_sms() {
+    if (!g_show_sms) return;
+
+    ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Messages", &g_show_sms);
+
+    // Left panel: conversations / peers
+    ImGui::BeginChild("##Contacts", ImVec2(140, 0), true);
+    ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "Peers");
+    ImGui::Separator();
+
+    auto peers = g_mesh.get_peers();
+    for (auto& p : peers) {
+        bool selected = (g_active_peer == p.peer_id);
+        auto* conv = g_sms.get_conversation(p.peer_id);
+        char label[128];
+        if (conv && conv->unread_count > 0) {
+            snprintf(label, sizeof(label), "%s (%d)", p.peer_id.c_str(), conv->unread_count);
+        } else {
+            snprintf(label, sizeof(label), "%s", p.peer_id.c_str());
+        }
+        if (ImGui::Selectable(label, selected)) {
+            g_active_peer = p.peer_id;
+            g_sms.mark_read(p.peer_id);
         }
     }
-    
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    // Right panel: chat
+    ImGui::BeginChild("##Chat");
+    if (!g_active_peer.empty()) {
+        ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "Chat with %s",
+                           g_active_peer.c_str());
+        ImGui::Separator();
+
+        // Message history
+        ImGui::BeginChild("##MsgHistory", ImVec2(0, -35), true);
+        auto* conv = g_sms.get_conversation(g_active_peer);
+        if (conv) {
+            for (auto& msg : conv->messages) {
+                if (msg.outgoing) {
+                    ImGui::TextColored(ImVec4(0.4f, 0.9f, 0.5f, 1.0f), "You: %s",
+                                       msg.text.c_str());
+                } else {
+                    ImGui::TextColored(ImVec4(0.9f, 0.9f, 0.5f, 1.0f), "%s: %s",
+                                       msg.peer_id.c_str(), msg.text.c_str());
+                }
+            }
+            // Auto-scroll
+            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 10)
+                ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+
+        // Input
+        ImGui::SetNextItemWidth(-70);
+        bool enter = ImGui::InputText("##msginput", g_sms_input, sizeof(g_sms_input),
+                                       ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if (ImGui::Button("Send", ImVec2(-1, 0)) || enter) {
+            if (g_sms_input[0] != '\0') {
+                g_sms.send(g_active_peer, g_sms_input);
+                g_mesh.send_text(g_active_peer, g_sms_input);
+                g_sms_input[0] = '\0';
+                ImGui::SetKeyboardFocusHere(-1);
+            }
+        }
+    } else {
+        ImGui::TextDisabled("Select a peer to start chatting");
+    }
+    ImGui::EndChild();
+
     ImGui::End();
 }
 
-void render_apps() {
-    if (g_show_dialer) {
-        ImGui::Begin("Dialer", &g_show_dialer);
-        if (!g_lockdown->is_app_allowed(APP_DIALER)) {
-            ImGui::TextColored(ImVec4(1,0,0,1), "APP BLOCKED BY LOCKDOWN");
-        } else {
-            ImGui::Text("Call Service: Active");
-            static char number[32] = "";
-            ImGui::InputText("Number", number, 32);
-            if (ImGui::Button("CALL", ImVec2(100, 40))) {
-                vos::log::info("UI", "Calling %s...", number);
-            }
+// ─── Camera Window ───────────────────────────────────────────
+static void render_camera() {
+    if (!g_show_camera) return;
+
+    ImGui::SetNextWindowSize(ImVec2(350, 400), ImGuiCond_FirstUseEver);
+    ImGui::Begin("Camera", &g_show_camera);
+
+    if (!g_camera.is_open()) {
+        ImGui::Text("Camera is off");
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.5f, 0.65f, 1.0f));
+        if (ImGui::Button("Open Camera", ImVec2(-1, 40))) {
+            g_camera.open();
         }
-        ImGui::End();
+        ImGui::PopStyleColor();
+    } else {
+        // Simulated viewfinder
+        ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.5f, 1.0f), "[LIVE VIEWFINDER]");
+        ImGui::BeginChild("##Viewfinder", ImVec2(-1, 200), true);
+        ImGui::TextWrapped("Camera feed is active. In production this would show the "
+                           "webcam stream via SDL2 texture rendering.");
+        ImGui::EndChild();
+
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+        if (ImGui::Button("CAPTURE", ImVec2(-1, 40))) {
+            g_camera.capture();
+        }
+        ImGui::PopStyleColor();
+
+        ImGui::SameLine();
+
+        if (ImGui::Button("Close Camera", ImVec2(120, 40))) {
+            g_camera.close();
+        }
+
+        // Gallery
+        ImGui::Separator();
+        ImGui::Text("Gallery (%zu photos)", g_camera.capture_count());
+        auto& gallery = g_camera.get_gallery();
+        for (int i = (int)gallery.size() - 1; i >= 0; i--) {
+            ImGui::BulletText("%s (%dx%d)", gallery[i].filename.c_str(),
+                              gallery[i].width, gallery[i].height);
+        }
     }
 
-    if (g_show_sms) {
-        ImGui::Begin("Messages", &g_show_sms);
-        if (!g_lockdown->is_app_allowed(APP_SMS)) {
-            ImGui::TextColored(ImVec4(1,0,0,1), "APP BLOCKED BY LOCKDOWN");
-        } else {
-            auto peers = g_mesh->get_peers();
-            ImGui::BeginChild("Peers", ImVec2(150, 0), true);
-            for (auto& p : peers) {
-                if (ImGui::Selectable(p.peer_id.c_str(), g_active_peer == p.peer_id)) {
-                    g_active_peer = p.peer_id;
-                }
-            }
-            ImGui::EndChild();
-            ImGui::SameLine();
-            ImGui::BeginChild("Chat", ImVec2(0, 0));
-            if (!g_active_peer.empty()) {
-                ImGui::Text("Chat with %s", g_active_peer.c_str());
-                ImGui::Separator();
-                // Chat history here...
-                ImGui::SetCursorPosY(ImGui::GetWindowHeight() - 40);
-                ImGui::InputText("##msg", g_sms_input, 256);
-                ImGui::SameLine();
-                if (ImGui::Button("Send")) {
-                    g_mesh->send_text(g_active_peer, g_sms_input);
-                    g_sms_input[0] = '\0';
-                }
-            } else {
-                ImGui::Text("Select a peer to chat");
-            }
-            ImGui::EndChild();
-        }
-        ImGui::End();
-    }
+    ImGui::End();
 }
 
+// ─── System Info Window ──────────────────────────────────────
+static void render_system_info() {
+    if (!g_show_system) return;
+
+    ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
+    ImGui::Begin("System Info", &g_show_system);
+
+    ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "VOS — Virtual OS v0.1.0");
+    ImGui::Separator();
+
+    // Privacy
+    auto id = g_privacy.get_current_identity();
+    if (ImGui::CollapsingHeader("Privacy Engine", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::BulletText("Virtual IP:  %s", id.virtual_ip.c_str());
+        ImGui::BulletText("Virtual MAC: %s", id.virtual_mac.c_str());
+        ImGui::BulletText("Rotations:   %llu", (unsigned long long)id.rotation_count);
+        ImGui::BulletText("Interval:    10 seconds");
+        if (ImGui::Button("Force Rotate")) g_privacy.force_rotate();
+    }
+
+    // Kernel
+    if (ImGui::CollapsingHeader("Kernel")) {
+        auto procs = g_kernel.list_processes();
+        ImGui::Text("Active processes: %zu", procs.size());
+        for (auto& p : procs) {
+            ImGui::BulletText("[%u] %s", p.pid, p.name.c_str());
+        }
+    }
+
+    // VFS
+    if (ImGui::CollapsingHeader("Virtual Filesystem")) {
+        ImGui::Text("Files: %zu  |  Size: %zu bytes", g_vfs.total_files(), g_vfs.total_size());
+    }
+
+    // Mesh
+    if (ImGui::CollapsingHeader("Mesh Network")) {
+        ImGui::Text("Peer ID: %s", g_mesh.get_own_id().c_str());
+        auto peers = g_mesh.get_peers();
+        ImGui::Text("Discovered peers: %zu", peers.size());
+        for (auto& p : peers) {
+            ImGui::BulletText("%s @ %s", p.peer_id.c_str(), p.address.c_str());
+        }
+    }
+
+    // Lockdown
+    if (ImGui::CollapsingHeader("Lockdown")) {
+        if (g_lockdown.is_active()) {
+            auto rem = g_lockdown.get_remaining_time();
+            ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1.0f),
+                               "ACTIVE — %llds remaining", (long long)rem.count());
+        } else {
+            ImGui::Text("Inactive");
+        }
+    }
+
+    ImGui::End();
+}
+
+// ─── Main ────────────────────────────────────────────────────
 int main(int argc, char** argv) {
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) {
-        std::cerr << "SDL_Init Error: " << SDL_GetError() << std::endl;
+    // SDL init
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+        fprintf(stderr, "SDL_Init Error: %s\n", SDL_GetError());
         return -1;
     }
 
@@ -138,69 +470,107 @@ int main(int argc, char** argv) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
-    SDL_Window* window = SDL_CreateWindow("VOS - Virtual OS", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 600, window_flags);
-    SDL_GLContext gl_context = SDL_GL_CreateContext(window);
-    SDL_GL_MakeCurrent(window, gl_context);
-    SDL_GL_SetSwapInterval(1);
+    SDL_WindowFlags wflags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
+                                               | SDL_WINDOW_ALLOW_HIGHDPI);
+    SDL_Window* window = SDL_CreateWindow("VOS - Virtual OS",
+                                          SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                          1024, 700, wflags);
+    if (!window) {
+        fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
+        return -1;
+    }
 
+    SDL_GLContext gl_ctx = SDL_GL_CreateContext(window);
+    SDL_GL_MakeCurrent(window, gl_ctx);
+    SDL_GL_SetSwapInterval(1); // VSync
+
+    // ImGui init
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO(); (void)io;
-    ImGui::StyleColorsDark();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    apply_vos_theme();
 
-    ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
+    ImGui_ImplSDL2_InitForOpenGL(window, gl_ctx);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-    // Initialize VOS Core
-    g_crypto = new Crypto(); g_crypto->init();
-    g_kernel = new Kernel(); g_kernel->init();
-    g_privacy = new PrivacyEngine(); g_privacy->init(10); // Rotate every 10s
-    g_mesh = new MeshNet(); g_mesh->init(g_crypto); g_mesh->start_discovery();
-    g_lockdown = new LockdownManager(); g_lockdown->init();
+    // ── Initialize VOS Core ──
+    g_crypto.init();
+    g_kernel.init();
+    g_vfs.init();
+    g_privacy.init(10); // IP rotates every 10 seconds
+    g_mesh.init(&g_crypto);
+    g_mesh.start_discovery();
+    g_lockdown.init();
+    g_dialer.init();
+    g_sms.init();
+    g_camera.init();
 
-    bool done = false;
-    while (!done) {
-        SDL_Event event;
-        while (SDL_PollEvent(&event)) {
-            ImGui_ImplSDL2_ProcessEvent(&event);
-            if (event.type == SDL_QUIT)
-                done = true;
-            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE && event.window.windowID == SDL_GetWindowID(window))
-                done = true;
+    // Wire mesh → SMS: incoming messages go into SMS app
+    g_mesh.on_message([](const std::string& peer_id, const ByteBuffer& payload) {
+        std::string text(payload.begin(), payload.end());
+        g_sms.receive(peer_id, text);
+    });
+
+    log::info("MAIN", "VOS Desktop started successfully");
+
+    // ── Main Loop ──
+    bool running = true;
+    while (running) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            ImGui_ImplSDL2_ProcessEvent(&ev);
+            if (ev.type == SDL_QUIT) running = false;
+            if (ev.type == SDL_WINDOWEVENT && ev.window.event == SDL_WINDOWEVENT_CLOSE
+                && ev.window.windowID == SDL_GetWindowID(window))
+                running = false;
         }
 
+        // Tick subsystems
+        g_kernel.tick();
+        g_dialer.tick();
+
+        // Render
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
 
-        render_status_bar();
-        render_desktop();
-        render_apps();
+        float dw = io.DisplaySize.x;
+        float dh = io.DisplaySize.y;
+
+        render_status_bar(dw);
+        render_desktop(dw, dh);
+        render_dialer();
+        render_sms();
+        render_camera();
+        render_system_info();
 
         ImGui::Render();
-        glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
-        glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+        glViewport(0, 0, (int)dw, (int)dh);
+        glClearColor(0.05f, 0.05f, 0.07f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         SDL_GL_SwapWindow(window);
-        
-        g_kernel->tick();
     }
 
-    // Cleanup
-    g_mesh->shutdown();
-    g_privacy->shutdown();
-    g_kernel->shutdown();
+    // ── Cleanup ──
+    g_camera.close();
+    g_mesh.shutdown();
+    g_privacy.shutdown();
+    g_kernel.shutdown();
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
 
-    SDL_GL_DeleteContext(gl_context);
-    SDL_WindowDestroy(window);
+    SDL_GL_DeleteContext(gl_ctx);
+    SDL_DestroyWindow(window);
     SDL_Quit();
 
+    log::info("MAIN", "VOS Desktop shutdown complete");
     return 0;
 }
