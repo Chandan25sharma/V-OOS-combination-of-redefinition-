@@ -20,6 +20,10 @@
 #include "core/mesh_net.h"
 #include "core/lockdown.h"
 #include "core/crypto.h"
+#include "core/settings.h"
+#include "core/dns_guard.h"
+#include "core/event_logger.h"
+#include "core/notifications.h"
 #include "apps/dialer.h"
 #include "apps/sms.h"
 #include "apps/camera.h"
@@ -28,21 +32,28 @@
 using namespace vos;
 
 // ─── Global System Objects ───────────────────────────────────
-static Kernel          g_kernel;
-static VirtualFS       g_vfs;
-static Crypto          g_crypto;
-static PrivacyEngine   g_privacy;
-static MeshNet         g_mesh;
-static LockdownManager g_lockdown;
-static Dialer          g_dialer;
-static SmsApp          g_sms;
-static CameraApp       g_camera;
+static Kernel               g_kernel;
+static VirtualFS            g_vfs;
+static Crypto               g_crypto;
+static PrivacyEngine        g_privacy;
+static MeshNet              g_mesh;
+static LockdownManager      g_lockdown;
+static Settings             g_settings;
+static DNSGuard             g_dns;
+static EventLogger          g_events;
+static NotificationManager  g_notify;
+static Dialer               g_dialer;
+static SmsApp               g_sms;
+static CameraApp            g_camera;
+static bool                 g_boot_done = false;
+static float                g_boot_timer = 0.0f;
 
 // ─── UI State ────────────────────────────────────────────────
 static bool g_show_dialer  = false;
 static bool g_show_sms     = false;
 static bool g_show_camera  = false;
 static bool g_show_system  = false;
+static bool g_show_events  = false;
 static bool g_show_lockdown_picker = false;
 
 static char g_dial_number[32]  = "";
@@ -403,58 +414,132 @@ static void render_camera() {
 static void render_system_info() {
     if (!g_show_system) return;
 
-    ImGui::SetNextWindowSize(ImVec2(400, 350), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(480, 500), ImGuiCond_FirstUseEver);
     ImGui::Begin("System Info", &g_show_system);
 
-    ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "VOS — Virtual OS v0.1.0");
+    ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "VOS — Virtual OS v0.3.0");
     ImGui::Separator();
 
-    // Privacy
     auto id = g_privacy.get_current_identity();
     if (ImGui::CollapsingHeader("Privacy Engine", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::BulletText("Virtual IP:  %s", id.virtual_ip.c_str());
         ImGui::BulletText("Virtual MAC: %s", id.virtual_mac.c_str());
         ImGui::BulletText("Rotations:   %llu", (unsigned long long)id.rotation_count);
-        ImGui::BulletText("Interval:    10 seconds");
-        if (ImGui::Button("Force Rotate")) g_privacy.force_rotate();
-    }
-
-    // Kernel
-    if (ImGui::CollapsingHeader("Kernel")) {
-        auto procs = g_kernel.list_processes();
-        ImGui::Text("Active processes: %zu", procs.size());
-        for (auto& p : procs) {
-            ImGui::BulletText("[%u] %s", p.pid, p.name.c_str());
+        if (ImGui::Button("Force Rotate")) {
+            g_privacy.force_rotate();
+            g_events.security("Privacy", "Manual IP/MAC rotation triggered");
+            g_notify.info("Identity rotated");
         }
     }
 
-    // VFS
+    if (ImGui::CollapsingHeader("DNS Guard")) {
+        auto stats = g_dns.get_stats();
+        ImGui::BulletText("Status: %s", g_dns.is_active() ? "ACTIVE" : "OFF");
+        ImGui::BulletText("Queries: %llu total", (unsigned long long)stats.queries_total);
+        ImGui::BulletText("Blocked: %llu", (unsigned long long)stats.queries_blocked);
+        ImGui::BulletText("Resolved: %llu", (unsigned long long)stats.queries_resolved);
+    }
+
+    if (ImGui::CollapsingHeader("Kernel")) {
+        auto procs = g_kernel.list_processes();
+        ImGui::Text("Active processes: %zu", procs.size());
+        for (auto& p : procs) ImGui::BulletText("[%u] %s", p.pid, p.name.c_str());
+    }
+
     if (ImGui::CollapsingHeader("Virtual Filesystem")) {
         ImGui::Text("Files: %zu  |  Size: %zu bytes", g_vfs.total_files(), g_vfs.total_size());
     }
 
-    // Mesh
     if (ImGui::CollapsingHeader("Mesh Network")) {
         ImGui::Text("Peer ID: %s", g_mesh.get_own_id().c_str());
         auto peers = g_mesh.get_peers();
         ImGui::Text("Discovered peers: %zu", peers.size());
-        for (auto& p : peers) {
-            ImGui::BulletText("%s @ %s", p.peer_id.c_str(), p.address.c_str());
-        }
+        for (auto& p : peers) ImGui::BulletText("%s @ %s", p.peer_id.c_str(), p.address.c_str());
     }
 
-    // Lockdown
     if (ImGui::CollapsingHeader("Lockdown")) {
         if (g_lockdown.is_active()) {
             auto rem = g_lockdown.get_remaining_time();
-            ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1.0f),
-                               "ACTIVE — %llds remaining", (long long)rem.count());
+            ImGui::TextColored(ImVec4(1, 0.3f, 0.3f, 1.0f), "ACTIVE — %llds remaining", (long long)rem.count());
         } else {
             ImGui::Text("Inactive");
         }
     }
 
+    if (ImGui::CollapsingHeader("Event Log")) {
+        auto events = g_events.get_recent(20);
+        ImGui::Text("Total events: %zu", g_events.total_events());
+        ImGui::BeginChild("##evlog", ImVec2(0, 150), true);
+        for (auto it = events.rbegin(); it != events.rend(); ++it) {
+            ImVec4 col = ImVec4(0.7f, 0.7f, 0.7f, 1.0f);
+            if (it->severity == EventSeverity::WARNING)  col = ImVec4(1.0f, 0.8f, 0.2f, 1.0f);
+            if (it->severity == EventSeverity::SECURITY) col = ImVec4(1.0f, 0.4f, 0.2f, 1.0f);
+            if (it->severity == EventSeverity::CRITICAL) col = ImVec4(1.0f, 0.1f, 0.1f, 1.0f);
+            ImGui::TextColored(col, "[%s] %s", it->source.c_str(), it->message.c_str());
+        }
+        ImGui::EndChild();
+    }
+
     ImGui::End();
+}
+
+// ─── Notification Overlay ────────────────────────────────────
+static void render_notifications(float dw) {
+    auto active = g_notify.get_active();
+    float y = 40;
+    for (auto& n : active) {
+        ImVec4 bg;
+        switch (n.type) {
+            case NotificationType::SUCCESS:  bg = ImVec4(0.1f, 0.4f, 0.15f, 0.9f); break;
+            case NotificationType::WARNING:  bg = ImVec4(0.5f, 0.35f, 0.05f, 0.9f); break;
+            case NotificationType::ERROR:    bg = ImVec4(0.5f, 0.1f, 0.1f, 0.9f); break;
+            case NotificationType::SECURITY: bg = ImVec4(0.6f, 0.05f, 0.05f, 0.95f); break;
+            default:                         bg = ImVec4(0.12f, 0.22f, 0.4f, 0.9f); break;
+        }
+        ImGui::SetNextWindowPos(ImVec2(dw - 310, y));
+        ImGui::SetNextWindowSize(ImVec2(300, 50));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, bg);
+        char wid[32]; snprintf(wid, 32, "##notif%u", n.id);
+        ImGui::Begin(wid, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                     | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar
+                     | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
+        ImGui::TextColored(ImVec4(1,1,1,1), "%s", n.title.c_str());
+        ImGui::TextWrapped("%s", n.message.c_str());
+        ImGui::End();
+        ImGui::PopStyleColor();
+        y += 55;
+    }
+}
+
+// ─── Boot Splash ─────────────────────────────────────────────
+static bool render_boot_splash(float dw, float dh, float dt) {
+    g_boot_timer += dt;
+    float alpha = 1.0f;
+    if (g_boot_timer > 2.5f) alpha = 1.0f - (g_boot_timer - 2.5f) / 0.5f;
+    if (alpha <= 0.0f) return true; // done
+
+    ImGui::SetNextWindowPos(ImVec2(0, 0));
+    ImGui::SetNextWindowSize(ImVec2(dw, dh));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.02f, 0.02f, 0.04f, alpha));
+    ImGui::Begin("##Boot", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar);
+
+    ImVec2 center(dw * 0.5f, dh * 0.4f);
+    float pulse = 0.7f + 0.3f * sinf(g_boot_timer * 3.0f);
+    ImGui::SetCursorPos(ImVec2(center.x - 60, center.y - 30));
+    ImGui::TextColored(ImVec4(0.3f * pulse, 0.7f * pulse, 1.0f * pulse, alpha), "V O S");
+    ImGui::SetCursorPos(ImVec2(center.x - 100, center.y + 20));
+    ImGui::TextColored(ImVec4(0.4f, 0.4f, 0.5f, alpha), "Virtual Operating System");
+
+    ImGui::SetCursorPos(ImVec2(center.x - 80, center.y + 60));
+    const char* steps[] = {"Initializing kernel...", "Starting privacy engine...",
+                           "Scanning mesh network...", "Loading apps...", "Ready."};
+    int step = (int)(g_boot_timer / 0.6f);
+    if (step > 4) step = 4;
+    ImGui::TextColored(ImVec4(0.3f, 0.8f, 0.4f, alpha), "%s", steps[step]);
+
+    ImGui::End();
+    ImGui::PopStyleColor();
+    return false;
 }
 
 // ─── Main ────────────────────────────────────────────────────
@@ -499,23 +584,36 @@ int main(int argc, char** argv) {
     ImGui_ImplOpenGL3_Init(glsl_version);
 
     // ── Initialize VOS Core ──
+    g_settings.init();
     g_crypto.init();
     g_kernel.init();
     g_vfs.init();
-    g_privacy.init(10); // IP rotates every 10 seconds
-    g_mesh.init(&g_crypto);
+    g_events.init();
+    g_notify.init();
+    g_dns.init();
+    g_privacy.init(g_settings.get_int(Settings::KEY_IP_ROTATION_INTERVAL, 10));
+    g_mesh.init(&g_crypto, (uint16_t)g_settings.get_int(Settings::KEY_MESH_PORT, 5055));
     g_mesh.start_discovery();
     g_lockdown.init();
     g_dialer.init();
     g_sms.init();
     g_camera.init();
 
-    // Wire mesh → SMS: incoming messages go into SMS app
+    // Wire mesh → SMS + event log
     g_mesh.on_message([](const std::string& peer_id, const ByteBuffer& payload) {
         std::string text(payload.begin(), payload.end());
         g_sms.receive(peer_id, text);
+        g_events.info("Mesh", "Message from " + peer_id);
+    });
+    g_mesh.on_peer_found([](const MeshPeer& p) {
+        g_events.info("Mesh", "Discovered peer: " + p.peer_id);
+        g_notify.info("Peer found: " + p.peer_id);
+    });
+    g_privacy.on_identity_changed([](const IdentityState& s) {
+        g_events.info("Privacy", "Identity rotated to " + s.virtual_ip);
     });
 
+    g_events.security("System", "VOS Desktop started");
     log::info("MAIN", "VOS Desktop started successfully");
 
     // ── Main Loop ──
@@ -533,6 +631,7 @@ int main(int argc, char** argv) {
         // Tick subsystems
         g_kernel.tick();
         g_dialer.tick();
+        g_notify.tick();
 
         // Render
         ImGui_ImplOpenGL3_NewFrame();
@@ -541,13 +640,19 @@ int main(int argc, char** argv) {
 
         float dw = io.DisplaySize.x;
         float dh = io.DisplaySize.y;
+        float dt = io.DeltaTime;
 
-        render_status_bar(dw);
-        render_desktop(dw, dh);
-        render_dialer();
-        render_sms();
-        render_camera();
-        render_system_info();
+        if (!g_boot_done) {
+            g_boot_done = render_boot_splash(dw, dh, dt);
+        } else {
+            render_status_bar(dw);
+            render_desktop(dw, dh);
+            render_dialer();
+            render_sms();
+            render_camera();
+            render_system_info();
+            render_notifications(dw);
+        }
 
         ImGui::Render();
         glViewport(0, 0, (int)dw, (int)dh);
@@ -558,7 +663,9 @@ int main(int argc, char** argv) {
     }
 
     // ── Cleanup ──
+    g_events.security("System", "VOS Desktop shutting down");
     g_camera.close();
+    g_dns.shutdown();
     g_mesh.shutdown();
     g_privacy.shutdown();
     g_kernel.shutdown();
