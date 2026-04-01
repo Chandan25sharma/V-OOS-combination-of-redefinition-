@@ -18,7 +18,7 @@ cmake --build build
 
 ## Architecture
 - `src/core/`     — Platform-agnostic C/C++ engine
-- `src/platform/` — OS-specific implementations
+- `src/platform/` — OS-specific implementations and valitation os 
 - `src/shell/`    — Desktop GUI (SDL2 + ImGui)
 - `src/apps/`     — Built-in apps (Dialer, SMS, Camera)
 - `tests/`        — Unit tests
